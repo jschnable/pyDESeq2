@@ -160,6 +160,22 @@ def test_low_maxit_flags_non_convergence() -> None:
     assert np.any(conv == 0.0)
 
 
+def test_wald_test_records_optimizer_stats() -> None:
+    counts, metadata = _simulate_dataset(seed=941, n_genes=80, n_samples=10)
+    dds = DESeq2(counts=counts, metadata=metadata, design="~ condition")
+    dds.estimate_size_factors().estimate_dispersions().nbinom_wald_test(maxit=1, use_optim=True)
+
+    assert dds.optimizer_stats_ is not None
+    stats = dds.optimizer_stats_
+    assert stats["test"] == "wald"
+    n_nonzero = int(stats["n_nonzero_genes"])
+    assert n_nonzero > 0
+    assert 0 <= int(stats["wald_mle_rows_for_optim"]) <= n_nonzero
+    assert 0.0 <= float(stats["wald_mle_fraction_for_optim"]) <= 1.0
+    assert 0 <= int(stats["wald_final_rows_for_optim"]) <= n_nonzero
+    assert 0.0 <= float(stats["wald_final_fraction_for_optim"]) <= 1.0
+
+
 def test_dispersion_fit_falls_back_to_mean_when_all_gene_estimates_near_min_disp() -> None:
     counts, metadata = _simulate_dataset(seed=95, n_genes=80, n_samples=10)
     dds = DESeq2(counts=counts, metadata=metadata, design="~ condition")

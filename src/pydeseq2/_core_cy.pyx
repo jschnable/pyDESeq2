@@ -1049,6 +1049,335 @@ def openmp_enabled() -> bool:
     return bool(pydeseq2_openmp_enabled())
 
 
+cdef inline int _nanargmax_small(double* values, int n) noexcept nogil:
+    cdef int j
+    cdef int idx = -1
+    cdef double best = 0.0
+    cdef double v
+    for j in range(n):
+        v = values[j]
+        if v != v:
+            continue
+        if idx < 0 or v > best:
+            best = v
+            idx = j
+    if idx < 0:
+        return 0
+    return idx
+
+
+cdef inline void _fit_grid_row_no_cr(
+    Py_ssize_t row,
+    const double[:, ::1] y,
+    const double[:, ::1] mu_hat,
+    const double[:, ::1] weights,
+    const double[::1] log_alpha_prior_mean,
+    double log_alpha_prior_sigmasq,
+    bint use_prior,
+    bint use_weights,
+    double min_log_alpha,
+    double max_log_alpha,
+    double[::1] out_log_alpha,
+) noexcept nogil:
+    cdef int n_grid = 20
+    cdef double coarse[20]
+    cdef double fine[20]
+    cdef double step = (max_log_alpha - min_log_alpha) / (n_grid - 1)
+    cdef double a
+    cdef double a_hat
+    cdef double delta
+    cdef double fine_min
+    cdef double fine_step
+    cdef int j
+    cdef int idxmax
+    cdef int idxmax_fine
+
+    for j in range(n_grid):
+        a = min_log_alpha + step * j
+        coarse[j] = _log_posterior_no_cr(
+            a,
+            y,
+            mu_hat,
+            weights,
+            row,
+            log_alpha_prior_mean[row],
+            log_alpha_prior_sigmasq,
+            use_prior,
+            use_weights,
+        )
+    idxmax = _nanargmax_small(&coarse[0], n_grid)
+    a_hat = min_log_alpha + step * idxmax
+    delta = step
+    fine_min = a_hat - delta
+    fine_step = (2.0 * delta) / (n_grid - 1)
+    for j in range(n_grid):
+        a = fine_min + fine_step * j
+        fine[j] = _log_posterior_no_cr(
+            a,
+            y,
+            mu_hat,
+            weights,
+            row,
+            log_alpha_prior_mean[row],
+            log_alpha_prior_sigmasq,
+            use_prior,
+            use_weights,
+        )
+    idxmax_fine = _nanargmax_small(&fine[0], n_grid)
+    out_log_alpha[row] = fine_min + fine_step * idxmax_fine
+
+
+cdef inline void _fit_grid_row_with_cr(
+    Py_ssize_t row,
+    const double[:, ::1] y,
+    const double[:, ::1] x,
+    const double[:, ::1] mu_hat,
+    const double[:, ::1] weights,
+    const double[::1] log_alpha_prior_mean,
+    double log_alpha_prior_sigmasq,
+    bint use_prior,
+    bint use_weights,
+    double weight_threshold,
+    double min_log_alpha,
+    double max_log_alpha,
+    double[::1] out_log_alpha,
+) noexcept nogil:
+    cdef int p = x.shape[1]
+    cdef size_t vec_bytes = <size_t>p * sizeof(int)
+    cdef size_t mat_bytes = <size_t>p * <size_t>p * sizeof(double)
+    cdef int* active = <int*>malloc(vec_bytes)
+    cdef int* active_idx = <int*>malloc(vec_bytes)
+    cdef double* b_mat = <double*>malloc(mat_bytes)
+    cdef double* db_mat = <double*>malloc(mat_bytes)
+    cdef double* chol_mat = <double*>malloc(mat_bytes)
+    cdef double* inv_mat = <double*>malloc(mat_bytes)
+    cdef double* work_mat = <double*>malloc(mat_bytes)
+    cdef int n_grid = 20
+    cdef double coarse[20]
+    cdef double fine[20]
+    cdef double step = (max_log_alpha - min_log_alpha) / (n_grid - 1)
+    cdef double a
+    cdef double a_hat
+    cdef double delta
+    cdef double fine_min
+    cdef double fine_step
+    cdef double lp
+    cdef double dlp
+    cdef int j
+    cdef int idxmax
+    cdef int idxmax_fine
+
+    if (
+        (active == NULL)
+        or (active_idx == NULL)
+        or (b_mat == NULL)
+        or (db_mat == NULL)
+        or (chol_mat == NULL)
+        or (inv_mat == NULL)
+        or (work_mat == NULL)
+    ):
+        if active != NULL:
+            free(active)
+        if active_idx != NULL:
+            free(active_idx)
+        if b_mat != NULL:
+            free(b_mat)
+        if db_mat != NULL:
+            free(db_mat)
+        if chol_mat != NULL:
+            free(chol_mat)
+        if inv_mat != NULL:
+            free(inv_mat)
+        if work_mat != NULL:
+            free(work_mat)
+        out_log_alpha[row] = min_log_alpha
+        return
+
+    for j in range(n_grid):
+        a = min_log_alpha + step * j
+        _log_and_dlog_posterior_with_cr(
+            a,
+            y,
+            mu_hat,
+            x,
+            weights,
+            row,
+            log_alpha_prior_mean[row],
+            log_alpha_prior_sigmasq,
+            use_prior,
+            use_weights,
+            weight_threshold,
+            active,
+            active_idx,
+            b_mat,
+            db_mat,
+            chol_mat,
+            inv_mat,
+            work_mat,
+            &lp,
+            &dlp,
+        )
+        coarse[j] = lp
+    idxmax = _nanargmax_small(&coarse[0], n_grid)
+    a_hat = min_log_alpha + step * idxmax
+    delta = step
+    fine_min = a_hat - delta
+    fine_step = (2.0 * delta) / (n_grid - 1)
+    for j in range(n_grid):
+        a = fine_min + fine_step * j
+        _log_and_dlog_posterior_with_cr(
+            a,
+            y,
+            mu_hat,
+            x,
+            weights,
+            row,
+            log_alpha_prior_mean[row],
+            log_alpha_prior_sigmasq,
+            use_prior,
+            use_weights,
+            weight_threshold,
+            active,
+            active_idx,
+            b_mat,
+            db_mat,
+            chol_mat,
+            inv_mat,
+            work_mat,
+            &lp,
+            &dlp,
+        )
+        fine[j] = lp
+    idxmax_fine = _nanargmax_small(&fine[0], n_grid)
+    out_log_alpha[row] = fine_min + fine_step * idxmax_fine
+
+    free(active)
+    free(active_idx)
+    free(b_mat)
+    free(db_mat)
+    free(chol_mat)
+    free(inv_mat)
+    free(work_mat)
+
+
+def fit_disp_grid_core(
+    cnp.ndarray[cnp.float64_t, ndim=2] y,
+    cnp.ndarray[cnp.float64_t, ndim=2] mu_hat,
+    cnp.ndarray[cnp.float64_t, ndim=1] log_alpha_prior_mean,
+    double log_alpha_prior_sigmasq,
+    bint use_prior,
+    cnp.ndarray[cnp.float64_t, ndim=2] weights,
+    bint use_weights,
+    x=None,
+    bint use_cr=False,
+    double weight_threshold=1e-2,
+    int n_threads=0,
+):
+    if y.ndim != 2:
+        raise ValueError("y must be a 2D matrix.")
+    if mu_hat.shape[0] != y.shape[0] or mu_hat.shape[1] != y.shape[1]:
+        raise ValueError("mu_hat must have same shape as y.")
+    if weights.shape[0] != y.shape[0] or weights.shape[1] != y.shape[1]:
+        raise ValueError("weights must have same shape as y.")
+    if log_alpha_prior_mean.shape[0] != y.shape[0]:
+        raise ValueError("log_alpha_prior_mean must have one value per row in y.")
+    if use_cr and x is None:
+        raise ValueError("x is required when use_cr=True.")
+
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] out_log_alpha = np.empty(y.shape[0], dtype=np.float64)
+    cdef cnp.ndarray[cnp.float64_t, ndim=2] x_c
+
+    cdef const double[:, ::1] y_mv = np.asarray(y, dtype=np.float64, order="C")
+    cdef const double[:, ::1] mu_mv = np.asarray(mu_hat, dtype=np.float64, order="C")
+    cdef const double[:, ::1] w_mv = np.asarray(weights, dtype=np.float64, order="C")
+    if x is None:
+        x_c = np.empty((y.shape[1], 0), dtype=np.float64)
+    else:
+        x_c = np.asarray(x, dtype=np.float64, order="C")
+    if x_c.shape[0] != y.shape[1]:
+        raise ValueError("x rows must equal the number of columns in y.")
+    cdef const double[:, ::1] x_mv = x_c
+    cdef const double[::1] prior_mean_mv = np.asarray(log_alpha_prior_mean, dtype=np.float64, order="C")
+    cdef double[::1] out_mv = out_log_alpha
+    cdef Py_ssize_t i
+    cdef Py_ssize_t n_rows = y.shape[0]
+    cdef double min_log_alpha = log(1e-8)
+    cdef double max_log_alpha
+    if y.shape[1] > 10:
+        max_log_alpha = log(<double>y.shape[1])
+    else:
+        max_log_alpha = log(10.0)
+
+    if use_cr:
+        if n_threads > 0:
+            for i in prange(n_rows, nogil=True, schedule="static", num_threads=n_threads):
+                _fit_grid_row_with_cr(
+                    i,
+                    y_mv,
+                    x_mv,
+                    mu_mv,
+                    w_mv,
+                    prior_mean_mv,
+                    log_alpha_prior_sigmasq,
+                    use_prior,
+                    use_weights,
+                    weight_threshold,
+                    min_log_alpha,
+                    max_log_alpha,
+                    out_mv,
+                )
+        else:
+            for i in prange(n_rows, nogil=True, schedule="static"):
+                _fit_grid_row_with_cr(
+                    i,
+                    y_mv,
+                    x_mv,
+                    mu_mv,
+                    w_mv,
+                    prior_mean_mv,
+                    log_alpha_prior_sigmasq,
+                    use_prior,
+                    use_weights,
+                    weight_threshold,
+                    min_log_alpha,
+                    max_log_alpha,
+                    out_mv,
+                )
+    else:
+        if n_threads > 0:
+            for i in prange(n_rows, nogil=True, schedule="static", num_threads=n_threads):
+                _fit_grid_row_no_cr(
+                    i,
+                    y_mv,
+                    mu_mv,
+                    w_mv,
+                    prior_mean_mv,
+                    log_alpha_prior_sigmasq,
+                    use_prior,
+                    use_weights,
+                    min_log_alpha,
+                    max_log_alpha,
+                    out_mv,
+                )
+        else:
+            for i in prange(n_rows, nogil=True, schedule="static"):
+                _fit_grid_row_no_cr(
+                    i,
+                    y_mv,
+                    mu_mv,
+                    w_mv,
+                    prior_mean_mv,
+                    log_alpha_prior_sigmasq,
+                    use_prior,
+                    use_weights,
+                    min_log_alpha,
+                    max_log_alpha,
+                    out_mv,
+                )
+
+    return np.exp(np.asarray(out_log_alpha))
+
+
 def fit_disp_core(
     cnp.ndarray[cnp.float64_t, ndim=2] y,
     cnp.ndarray[cnp.float64_t, ndim=2] mu_hat,

@@ -68,10 +68,13 @@ pytest
 
 Optional Cython + OpenMP acceleration for dispersion fitting is built at install time when possible.
 
+Python fallback is disabled by default because it is much slower than the Cython kernels.
+
 - Set `PYDESEQ2_OPENMP=1` to force OpenMP build attempt.
 - Set `PYDESEQ2_OPENMP=0` to disable OpenMP flags.
 - Set `PYDESEQ2_NUM_THREADS=<n>` to control runtime threads used by the Cython dispersion kernel.
-- Set `PYDESEQ2_DISABLE_CYTHON=1` to force Python fallback.
+- Set `PYDESEQ2_ALLOW_PYTHON_FALLBACK=1` to explicitly allow slow Python fallback when Cython is unavailable/failing.
+- Set `PYDESEQ2_DISABLE_CYTHON=1` to explicitly run the slow Python implementation.
 - Set `PYDESEQ2_SHOW_FALLBACK_EXCEPTIONS=1` to include full exception details in Cython fallback warnings.
 
 Optional parity test against installed R `DESeq2`:

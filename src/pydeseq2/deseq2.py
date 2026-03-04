@@ -26,17 +26,32 @@ _USE_CYTHON_DISP = os.environ.get("PYDESEQ2_DISABLE_CYTHON", "").strip().lower()
 }
 if _USE_CYTHON_DISP:
     try:
-        from ._core_cy import fit_disp_core as _fit_disp_cy
-        from ._core_cy import fit_glm_core as _fit_glm_cy
-        from ._core_cy import openmp_enabled as _disp_openmp_enabled
+        from . import _core_cy as _core_cy_mod
     except Exception:  # pragma: no cover - optional acceleration module.
         _fit_disp_cy = None
+        _fit_disp_grid_cy = None
         _fit_glm_cy = None
 
         def _disp_openmp_enabled() -> bool:
             return False
+    else:
+        _fit_disp_cy = getattr(_core_cy_mod, "fit_disp_core", None)
+        _fit_disp_grid_cy = getattr(_core_cy_mod, "fit_disp_grid_core", None)
+        _fit_glm_cy = getattr(_core_cy_mod, "fit_glm_core", None)
+        _openmp_enabled_fn = getattr(_core_cy_mod, "openmp_enabled", None)
+
+        if callable(_openmp_enabled_fn):
+
+            def _disp_openmp_enabled() -> bool:
+                return bool(_openmp_enabled_fn())
+
+        else:
+
+            def _disp_openmp_enabled() -> bool:
+                return False
 else:  # pragma: no cover - environment disables acceleration path.
     _fit_disp_cy = None
+    _fit_disp_grid_cy = None
     _fit_glm_cy = None
 
     def _disp_openmp_enabled() -> bool:
@@ -46,6 +61,7 @@ else:  # pragma: no cover - environment disables acceleration path.
 LOG2E = float(np.log2(np.e))
 LN2 = float(np.log(2.0))
 _CYTHON_FALLBACK_WARNED: set[str] = set()
+_TRUTHY_ENV = {"1", "true", "yes", "on"}
 
 
 def _is_noisy_matmul_fallback(exc: Exception) -> bool:
@@ -55,27 +71,50 @@ def _is_noisy_matmul_fallback(exc: Exception) -> bool:
     )
 
 
-def _warn_cython_fallback_once(backend: str, exc: Exception) -> None:
-    """Warn once per backend when optional Cython acceleration falls back."""
-    if _is_noisy_matmul_fallback(exc):
+def _python_fallback_enabled() -> bool:
+    return (
+        os.environ.get("PYDESEQ2_ALLOW_PYTHON_FALLBACK", "").strip().lower() in _TRUTHY_ENV
+        or os.environ.get("PYDESEQ2_DISABLE_CYTHON", "").strip().lower() in _TRUTHY_ENV
+    )
+
+
+def _warn_cython_fallback_once(backend: str, exc: Optional[Exception] = None) -> None:
+    """Warn once per backend when falling back to the slow Python implementation."""
+    if (exc is not None) and _is_noisy_matmul_fallback(exc):
         return
     if backend in _CYTHON_FALLBACK_WARNED:
         return
     _CYTHON_FALLBACK_WARNED.add(backend)
-    show_details = os.environ.get("PYDESEQ2_SHOW_FALLBACK_EXCEPTIONS", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    if show_details:
-        msg = f"Cython {backend} backend failed, falling back to Python implementation: {exc}"
+    show_details = os.environ.get("PYDESEQ2_SHOW_FALLBACK_EXCEPTIONS", "").strip().lower() in _TRUTHY_ENV
+    if show_details and (exc is not None):
+        msg = (
+            f"Cython {backend} backend failed; falling back to Python implementation "
+            f"(much slower): {exc}"
+        )
     else:
         msg = (
-            f"Cython {backend} backend failed once; falling back to Python implementation. "
+            f"Cython {backend} backend is unavailable or failed; falling back to Python "
+            "implementation (much slower). "
             "Set PYDESEQ2_SHOW_FALLBACK_EXCEPTIONS=1 to show exception details."
         )
     warnings.warn(msg, RuntimeWarning, stacklevel=2)
+
+
+def _handle_cython_backend_issue(backend: str, exc: Optional[Exception] = None) -> None:
+    """Raise by default; only allow fallback when explicitly requested."""
+    if _python_fallback_enabled():
+        _warn_cython_fallback_once(backend, exc)
+        return
+
+    if exc is None:
+        detail = f"Cython {backend} backend is unavailable."
+    else:
+        detail = f"Cython {backend} backend failed: {exc}"
+    raise RuntimeError(
+        f"{detail} Python fallback is disabled by default because it is much slower. "
+        "Fix the Cython backend, or rerun with PYDESEQ2_ALLOW_PYTHON_FALLBACK=1 "
+        "(or PYDESEQ2_DISABLE_CYTHON=1) to explicitly allow slow fallback."
+    ) from exc
 
 
 class DESeq2Error(RuntimeError):
@@ -554,6 +593,7 @@ class DESeq2:
         self.score_null_beta_conv_: Optional[np.ndarray] = None
         self.score_null_beta_iter_: Optional[np.ndarray] = None
         self.score_null_minmu_: Optional[float] = None
+        self.optimizer_stats_: Optional[dict[str, Union[int, float, str]]] = None
 
         self.internal_to_result_name_: dict[str, str] = {}
         self.result_name_to_internal_: dict[str, str] = {}
@@ -1531,7 +1571,9 @@ class DESeq2:
                     n_threads=_cython_num_threads(),
                 )
             except Exception as exc:  # pragma: no cover - runtime fallback safety.
-                _warn_cython_fallback_once("dispersion", exc)
+                _handle_cython_backend_issue("dispersion", exc)
+        else:
+            _handle_cython_backend_issue("dispersion")
 
         y_n = y.shape[0]
         log_alpha_out = np.asarray(log_alpha, dtype=float).copy()
@@ -1670,6 +1712,37 @@ class DESeq2:
         weight_threshold: float,
         use_cr: bool,
     ) -> np.ndarray:
+        if _fit_disp_grid_cy is not None:
+            try:
+                y_c = np.asarray(y, dtype=float, order="C")
+                mu_c = np.asarray(mu_hat, dtype=float, order="C")
+                prior_mean_c = np.asarray(log_alpha_prior_mean, dtype=float, order="C")
+                x_c = np.asarray(x, dtype=float, order="C")
+                if use_weights:
+                    weights_c = np.asarray(weights, dtype=float, order="C")
+                else:
+                    weights_c = np.ones_like(y_c, dtype=float)
+                return np.asarray(
+                    _fit_disp_grid_cy(
+                        y_c,
+                        mu_c,
+                        prior_mean_c,
+                        float(log_alpha_prior_sigmasq),
+                        bool(use_prior),
+                        weights_c,
+                        bool(use_weights),
+                        x=x_c,
+                        use_cr=bool(use_cr),
+                        weight_threshold=float(weight_threshold),
+                        n_threads=_cython_num_threads(),
+                    ),
+                    dtype=float,
+                )
+            except Exception as exc:  # pragma: no cover - runtime fallback safety.
+                _handle_cython_backend_issue("dispersion-grid", exc)
+        else:
+            _handle_cython_backend_issue("dispersion-grid")
+
         min_log_alpha = np.log(1e-8)
         max_log_alpha = np.log(max(10, y.shape[1]))
         disp_grid = np.linspace(min_log_alpha, max_log_alpha, num=20)
@@ -1809,6 +1882,7 @@ class DESeq2:
         minmu: float = 0.5,
         weights: Optional[np.ndarray] = None,
         mu_only: bool = False,
+        return_optimizer_rows: bool = False,
     ) -> dict:
         counts = _as_float_matrix(counts, "counts")
         x = _as_float_matrix(model_matrix, "model_matrix")
@@ -1911,7 +1985,9 @@ class DESeq2:
                         ),
                     }
                 except Exception as exc:  # pragma: no cover - runtime fallback safety.
-                    _warn_cython_fallback_once("GLM", exc)
+                    _handle_cython_backend_issue("GLM", exc)
+            else:
+                _handle_cython_backend_issue("GLM")
 
             mu = np.full((n_genes, n_samples), np.nan, dtype=float)
             beta_iter = np.zeros(n_genes, dtype=int)
@@ -2002,7 +2078,9 @@ class DESeq2:
                 beta_iter = np.asarray(glm_core["beta_iter"], dtype=int)
                 used_cython_glm = True
             except Exception as exc:  # pragma: no cover - runtime fallback safety.
-                _warn_cython_fallback_once("GLM", exc)
+                _handle_cython_backend_issue("GLM", exc)
+        else:
+            _handle_cython_backend_issue("GLM")
 
         if not used_cython_glm:
             for i in range(n_genes):
@@ -2148,7 +2226,7 @@ class DESeq2:
             else:
                 log_like[row] = np.sum(ll_vec)
 
-        return {
+        out = {
             "log_like": log_like,
             "beta_conv": beta_conv,
             "beta_matrix": beta_matrix,
@@ -2157,6 +2235,10 @@ class DESeq2:
             "beta_iter": beta_iter,
             "hat_diagonals": hat_diagonals,
         }
+        if return_optimizer_rows:
+            out["n_rows_for_optim"] = int(rows_for_optim.size)
+            out["n_genes"] = int(n_genes)
+        return out
 
     def estimate_dispersions_gene_est(
         self,
@@ -2645,6 +2727,7 @@ class DESeq2:
             use_qr=use_qr,
             minmu=minmu,
             weights=weights_nz,
+            return_optimizer_rows=True,
         )
         full_mle = np.full((self.n_genes, len(coef_standard)), np.nan, dtype=float)
         full_mle[nz_idx, :] = mle_fit["beta_matrix"]
@@ -2693,6 +2776,7 @@ class DESeq2:
                 use_qr=use_qr,
                 minmu=minmu,
                 weights=weights_nz,
+                return_optimizer_rows=True,
             )
         else:
             self.model_matrix_ = mm_standard.copy()
@@ -2701,6 +2785,24 @@ class DESeq2:
             self._refresh_result_name_map()
             fit = mle_fit
             self.beta_prior_var_ = np.repeat(1e6, self.n_coefs)
+
+        n_nz_genes = int(nz_idx.size)
+        mle_rows_for_optim = int(mle_fit.get("n_rows_for_optim", 0))
+        final_rows_for_optim = int(fit.get("n_rows_for_optim", mle_rows_for_optim))
+        if n_nz_genes > 0:
+            mle_frac_for_optim = float(mle_rows_for_optim / n_nz_genes)
+            final_frac_for_optim = float(final_rows_for_optim / n_nz_genes)
+        else:
+            mle_frac_for_optim = 0.0
+            final_frac_for_optim = 0.0
+        self.optimizer_stats_ = {
+            "test": "wald",
+            "n_nonzero_genes": n_nz_genes,
+            "wald_mle_rows_for_optim": mle_rows_for_optim,
+            "wald_mle_fraction_for_optim": mle_frac_for_optim,
+            "wald_final_rows_for_optim": final_rows_for_optim,
+            "wald_final_fraction_for_optim": final_frac_for_optim,
+        }
 
         # Cook's distance follows DESeq2 behavior: based on standard model matrix fit.
         self.disp_model_matrix_ = mm_standard.copy()
@@ -2814,6 +2916,7 @@ class DESeq2:
             use_qr=use_qr,
             minmu=minmu,
             weights=weights_nz,
+            return_optimizer_rows=True,
         )
         reduced_fit = self._fit_nbinom_glms(
             counts=counts_nz,
@@ -2826,7 +2929,25 @@ class DESeq2:
             use_qr=use_qr,
             minmu=minmu,
             weights=weights_nz,
+            return_optimizer_rows=True,
         )
+        n_nz_genes = int(nz_idx.size)
+        full_rows_for_optim = int(full_fit.get("n_rows_for_optim", 0))
+        reduced_rows_for_optim = int(reduced_fit.get("n_rows_for_optim", 0))
+        if n_nz_genes > 0:
+            full_frac_for_optim = float(full_rows_for_optim / n_nz_genes)
+            reduced_frac_for_optim = float(reduced_rows_for_optim / n_nz_genes)
+        else:
+            full_frac_for_optim = 0.0
+            reduced_frac_for_optim = 0.0
+        self.optimizer_stats_ = {
+            "test": "lrt",
+            "n_nonzero_genes": n_nz_genes,
+            "lrt_full_rows_for_optim": full_rows_for_optim,
+            "lrt_full_fraction_for_optim": full_frac_for_optim,
+            "lrt_reduced_rows_for_optim": reduced_rows_for_optim,
+            "lrt_reduced_fraction_for_optim": reduced_frac_for_optim,
+        }
 
         lrt_stat_nz = 2.0 * (full_fit["log_like"] - reduced_fit["log_like"])
         lrt_pval_nz = chi2.sf(lrt_stat_nz, df=df)

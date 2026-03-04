@@ -113,6 +113,50 @@ def test_fit_disp_uses_cython_backend_when_cox_reid_enabled(monkeypatch) -> None
     assert out["log_alpha"].shape[0] == args["y"].shape[0]
 
 
+def test_fit_disp_grid_uses_cython_backend_when_available(monkeypatch) -> None:
+    called = {"value": False}
+
+    def fake_fit_disp_grid_cy(
+        y,
+        mu_hat,
+        log_alpha_prior_mean,
+        log_alpha_prior_sigmasq,
+        use_prior,
+        weights,
+        use_weights,
+        x=None,
+        use_cr=False,
+        weight_threshold=1e-2,
+        n_threads=0,
+    ):
+        called["value"] = True
+        assert n_threads == 5
+        assert x is not None
+        assert use_cr is True
+        assert weight_threshold == pytest.approx(1e-2)
+        return np.full(y.shape[0], 0.2, dtype=float)
+
+    monkeypatch.setattr(deseq2_mod, "_fit_disp_grid_cy", fake_fit_disp_grid_cy)
+    monkeypatch.setattr(deseq2_mod, "_cython_num_threads", lambda: 5)
+
+    args = _fit_disp_inputs()
+    out = DESeq2._fit_disp_grid(
+        y=args["y"],
+        x=args["x"],
+        mu_hat=args["mu_hat"],
+        log_alpha_prior_mean=args["log_alpha_prior_mean"],
+        log_alpha_prior_sigmasq=args["log_alpha_prior_sigmasq"],
+        use_prior=args["use_prior"],
+        weights=args["weights"],
+        use_weights=args["use_weights"],
+        weight_threshold=args["weight_threshold"],
+        use_cr=True,
+    )
+
+    assert called["value"]
+    np.testing.assert_allclose(out, np.full(args["y"].shape[0], 0.2, dtype=float))
+
+
 def test_invalid_cython_num_threads_env_warns(monkeypatch) -> None:
     monkeypatch.setenv("PYDESEQ2_NUM_THREADS", "abc")
     with pytest.warns(RuntimeWarning, match="PYDESEQ2_NUM_THREADS"):
@@ -228,6 +272,8 @@ def test_fit_nbinom_glms_mu_only_uses_cython_backend_when_available(monkeypatch)
 
 
 def test_matmul_fallback_warning_is_suppressed(monkeypatch) -> None:
+    monkeypatch.setenv("PYDESEQ2_ALLOW_PYTHON_FALLBACK", "1")
+
     def fake_fit_glm_core(*args, **kwargs):
         raise ValueError(
             "matmul: Input operand 1 has a mismatch in its core dimension 0"
@@ -259,6 +305,8 @@ def test_matmul_fallback_warning_is_suppressed(monkeypatch) -> None:
 
 
 def test_non_matmul_fallback_warning_is_generic_and_once(monkeypatch) -> None:
+    monkeypatch.setenv("PYDESEQ2_ALLOW_PYTHON_FALLBACK", "1")
+
     def fake_fit_glm_core(*args, **kwargs):
         raise ValueError("synthetic backend failure")
 
@@ -297,3 +345,51 @@ def test_non_matmul_fallback_warning_is_generic_and_once(monkeypatch) -> None:
     msg = str(runtime[0].message)
     assert "falling back to Python implementation" in msg
     assert "synthetic backend failure" not in msg
+
+
+def test_backend_failure_raises_when_python_fallback_not_enabled(monkeypatch) -> None:
+    monkeypatch.delenv("PYDESEQ2_ALLOW_PYTHON_FALLBACK", raising=False)
+    monkeypatch.delenv("PYDESEQ2_DISABLE_CYTHON", raising=False)
+
+    def fake_fit_glm_core(*args, **kwargs):
+        raise ValueError("synthetic backend failure")
+
+    monkeypatch.setattr(deseq2_mod, "_fit_glm_cy", fake_fit_glm_core)
+    monkeypatch.setattr(deseq2_mod, "_cython_num_threads", lambda: 2)
+
+    counts = np.array([[10.0, 12.0, 14.0], [9.0, 8.0, 7.0]], dtype=float)
+    model_matrix = np.column_stack(
+        [np.ones(3, dtype=float), np.array([0.0, 1.0, 0.0])]
+    )
+    normalization_factors = np.ones_like(counts)
+    alpha_hat = np.array([0.2, 0.3], dtype=float)
+
+    with pytest.raises(RuntimeError, match="PYDESEQ2_ALLOW_PYTHON_FALLBACK=1"):
+        DESeq2._fit_nbinom_glms(
+            counts=counts,
+            model_matrix=model_matrix,
+            normalization_factors=normalization_factors,
+            alpha_hat=alpha_hat,
+            use_optim=False,
+            mu_only=True,
+        )
+
+
+def test_fit_nbinom_glms_can_report_optimizer_rows() -> None:
+    counts = np.array([[10.0, 12.0, 14.0], [9.0, 8.0, 7.0]], dtype=float)
+    model_matrix = np.column_stack([np.ones(3, dtype=float), np.array([0.0, 1.0, 0.0])])
+    normalization_factors = np.ones_like(counts)
+    alpha_hat = np.array([0.2, 0.3], dtype=float)
+
+    out = DESeq2._fit_nbinom_glms(
+        counts=counts,
+        model_matrix=model_matrix,
+        normalization_factors=normalization_factors,
+        alpha_hat=alpha_hat,
+        use_optim=False,
+        force_optim=True,
+        return_optimizer_rows=True,
+    )
+
+    assert out["n_rows_for_optim"] == counts.shape[0]
+    assert out["n_genes"] == counts.shape[0]
